@@ -345,6 +345,7 @@ def scaled_dot_product_attention(
     if mask is not None:
         qk_proj = torch.where(mask, qk_proj, -torch.inf)
 
+    # shape: (..., num_heads, queries, keys)
     probabilities = softmax(qk_proj, dimension=-1)
 
     attention = einsum(
