@@ -1,6 +1,6 @@
 import torch
-from torch import nn
-from einops import einsum, reduce
+from torch import nn, Tensor
+from einops import einsum, reduce, rearrange
 from jaxtyping import Float, Int, Bool
 
 class Linear(nn.Module):
@@ -39,8 +39,8 @@ class Linear(nn.Module):
 
     def forward(
         self,
-        x: Float[torch.Tensor, "... d_in"]
-    ) -> Float[torch.Tensor, "... d_out"]:
+        x: Float[Tensor, "... d_in"]
+    ) -> Float[Tensor, "... d_out"]:
         """Apply the transformation. Accepts any number of leading batch dims."""
         # contract over d_in; d_out survives -> equivalent to x @ W.T
         return einsum(x, self.weight,"... d_in, d_out d_in -> ... d_out")
@@ -81,8 +81,8 @@ class Embedding(nn.Module):
 
     def forward(
         self,
-        token_ids: Int[torch.Tensor, "..."]
-    ) -> Float[torch.Tensor, "... d_model"]:
+        token_ids: Int[Tensor, "..."]
+    ) -> Float[Tensor, "... d_model"]:
         """Look up embeddings for a batch of token IDs.
 
         Args:
@@ -128,8 +128,8 @@ class RMSNorm(nn.Module):
 
     def forward(
         self,
-        x: Float[torch.Tensor, "... d_model"]
-    ) -> Float[torch.Tensor, "... d_model"]:
+        x: Float[Tensor, "... d_model"]
+    ) -> Float[Tensor, "... d_model"]:
         """Normalize x over its last dimension, returning the original dtype."""
         # squaring in fp16/bf16 overflows, so normalize in fp32 and cast back
         in_dtype = x.dtype
@@ -141,7 +141,7 @@ class RMSNorm(nn.Module):
 
         return result.to(in_dtype)
 
-def silu(x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
+def silu(x: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
     """SiLU / Swish activation: x * sigmoid(x).
 
     Uses torch.sigmoid rather than the algebraically equivalent x / (1 + exp(-x)),
@@ -193,8 +193,8 @@ class SwiGLU(nn.Module):
 
     def forward(
         self,
-        x: Float[torch.Tensor, "... d_model"]
-    ) -> Float[torch.Tensor, "... d_model"]:
+        x: Float[Tensor, "... d_model"]
+    ) -> Float[Tensor, "... d_model"]:
         """Apply the gated feed-forward transform. Shape is preserved."""
         # w1 branch is activated, w3 branch is the gate
         gated = silu(self.w1(x)) * self.w3(x)
@@ -230,8 +230,8 @@ class RoPE(nn.Module):
         sin_table, cos_table (Tensor): Shape (max_seq_len, d_k/2), registered with
             persistent=False -- they are fully derived from the constructor args.
     """
-    sin_table: Float[torch.Tensor, "max_seq_len d_k/2"]
-    cos_table: Float[torch.Tensor, "max_seq_len d_k/2"]
+    sin_table: Float[Tensor, "max_seq_len d_k/2"]
+    cos_table: Float[Tensor, "max_seq_len d_k/2"]
 
     def __init__(
         self,
@@ -262,9 +262,9 @@ class RoPE(nn.Module):
 
     def forward(
         self,
-        x: Float[torch.Tensor, "... seq_len d_k"],
-        token_positions: Int[torch.Tensor, "... seq_len"],
-    ) -> Float[torch.Tensor, "... seq_len d_k"]:
+        x: Float[Tensor, "... seq_len d_k"],
+        token_positions: Int[Tensor, "... seq_len"],
+    ) -> Float[Tensor, "... seq_len d_k"]:
         """Rotate the pairs of x according to each token's position.
 
         Args:
@@ -291,7 +291,7 @@ class RoPE(nn.Module):
         # Shape: (..., seq, d_k)
         return torch.stack([out_even, out_odd], dim=-1).flatten(-2)
 
-def softmax(x: Float[torch.Tensor, "..."], dimension: int) -> Float[torch.Tensor, "..."]:
+def softmax(x: Float[Tensor, "..."], dimension: int) -> Float[Tensor, "..."]:
     """Numerically stable softmax along `dimension`.
 
     Subtracts the max before exponentiating. softmax is invariant to adding a
@@ -314,11 +314,12 @@ def softmax(x: Float[torch.Tensor, "..."], dimension: int) -> Float[torch.Tensor
     return exp_z / sum_exp
 
 def scaled_dot_product_attention(
-    Q: Float[torch.Tensor, "... queries d_k"],
-    K: Float[torch.Tensor, "... keys d_k"],
-    V: Float[torch.Tensor, "... keys d_v"],
-    mask: Bool[torch.Tensor, "queries keys"] | None = None
-) -> Float[torch.Tensor, "... queries d_v"]:
+    Q: Float[Tensor, "... queries d_k"],
+    K: Float[Tensor, "... keys d_k"],
+    V: Float[Tensor, "... keys d_v"],
+    *,
+    mask: Bool[Tensor, "queries keys"] | None = None
+) -> Float[Tensor, "... queries d_v"]:
     """Scaled dot-product attention:
 
         Attention(Q, K, V) = softmax(Q K^T / sqrt(d_k)) V
@@ -352,3 +353,332 @@ def scaled_dot_product_attention(
     )
 
     return attention
+
+class CausalMaskedMultiHeadSelfAttention(nn.Module):
+    """Causal multi-head self-attention without rotary position embeddings.
+
+    MultiHeadSelfAttention(x) = W_O @ MultiHead(W_Q @ x, W_K @ x, W_V @ x)
+
+    Multi-head attention is FLOP and parameter-neutral versus single-head: each
+    head does 2 n^2 d_k work and there are h of them, so the total is 2 n^2 d_model
+    and W_Q is (h * d_k, d_model) = (d_model, d_model). It allows
+    h independent attention distributions per query instead of one, so the layer can
+    attend to several things at once rather than averaging them into a single
+    blurred retrieval.
+
+    Args:
+        d_model (int): Model dimension. Must be divisible by num_heads.
+        num_heads (int): Number of attention heads. Each gets d_k = d_v = d_model/h.
+        device (torch.device | None): Device to store the parameters on.
+        dtype (torch.dtype | None): Data type of the parameters.
+
+    Attributes:
+        q_proj, k_proj, v_proj (Linear): (d_model, d_model). One matmul each covers
+            ALL heads -- the output's last axis is the heads' d_k blocks concatenated.
+        output_proj (Linear): (d_model, d_model). Mixes the concatenated head outputs
+            back into the residual stream. Named output_proj, not o_proj, to match the
+            reference state dict key layers.{i}.attn.output_proj.weight.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None
+    ):
+        super().__init__()
+
+        self.num_heads = num_heads
+        self.d_model = d_model
+        self.head_dim = self.d_model // self.num_heads
+
+        self.q_proj = Linear(self.d_model, self.head_dim * self.num_heads, device=device, dtype=dtype)
+        self.k_proj = Linear(self.d_model, self.head_dim * self.num_heads, device=device, dtype=dtype)
+        self.v_proj = Linear(self.d_model, self.head_dim * self.num_heads, device=device, dtype=dtype)
+        self.output_proj = Linear(self.head_dim * self.num_heads, self.d_model, device=device, dtype=dtype)
+
+    def forward(
+        self,
+        x: Float[Tensor, "... seq_len d_model"],
+    ) -> Float[Tensor, "... seq_len d_model"]:
+        """Apply causal multi-head self-attention.
+
+        Args:
+            x: Shape (..., seq_len, d_model).
+
+        Returns:
+            Tensor of the same shape as x.
+        """
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # reshaping the QKV projections into (..., num_heads, seq_len, head_dim) shape for independent Attention
+        q = rearrange(q, "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
+        k = rearrange(k, "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
+        v = rearrange(v, "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
+
+        # slicing a causal mask for the appropriate seq len
+        seq_len = x.shape[-2]
+        causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=q.device, dtype=torch.bool))
+
+        out = scaled_dot_product_attention(q, k, v, mask=causal_mask)
+
+        # merging head back into (..., seq_len, d_model)
+        out = rearrange(out, "... num_heads seq_len head_dim -> ... seq_len (num_heads head_dim)")
+
+        return self.output_proj(out)
+
+class CausalMaskedMultiHeadSelfAttentionWithRoPE(nn.Module):
+    """Causal multi-head self-attention with rotary position embeddings.
+
+    MultiHeadSelfAttention(x) = W_O @ MultiHead(W_Q @ x, W_K @ x, W_V @ x)
+
+    Multi-head attention is FLOP and parameter-neutral versus single-head: each
+    head does 2 n^2 d_k work and there are h of them, so the total is 2 n^2 d_model
+    and W_Q is (h * d_k, d_model) = (d_model, d_model). It allows
+    h independent attention distributions per query instead of one, so the layer can
+    attend to several things at once rather than averaging them into a single
+    blurred retrieval.
+
+    Args:
+        d_model (int): Model dimension. Must be divisible by num_heads.
+        num_heads (int): Number of attention heads. Each gets d_k = d_v = d_model/h.
+        theta (float): RoPE base Theta.
+        max_seq_len (int): Longest sequence RoPE must support.
+        device (torch.device | None): Device to store the parameters on.
+        dtype (torch.dtype | None): Data type of the parameters.
+
+    Attributes:
+        causal_mask (Tensor): (max_seq_len, max_seq_len) lower-triangular bool.
+            True means "attend". Built once and sliced per call, since it depends
+            only on max_seq_len.
+        q_proj, k_proj, v_proj (Linear): (d_model, d_model). One matmul each covers
+            ALL heads -- the output's last axis is the heads' d_k blocks concatenated.
+        output_proj (Linear): (d_model, d_model). Mixes the concatenated head outputs
+            back into the residual stream. Named output_proj, not o_proj, to match the
+            reference state dict key layers.{i}.attn.output_proj.weight.
+        rope (RoPE): Shared by q and k. Has no parameters, so one instance suffices.
+    """
+    causal_mask: Bool[Tensor, "max_seq_len max_seq_len"]
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        theta: float,
+        max_seq_len: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None
+    ):
+        super().__init__()
+
+        self.num_heads = num_heads
+        self.d_model = d_model
+        self.head_dim = self.d_model // self.num_heads
+
+        # causal mask for the attention operation where True means allowed
+        causal_mask = torch.tril(torch.ones((max_seq_len, max_seq_len), device=device, dtype=torch.bool))
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
+        
+        self.q_proj = Linear(self.d_model, self.head_dim * self.num_heads, device=device, dtype=dtype)
+        self.k_proj = Linear(self.d_model, self.head_dim * self.num_heads, device=device, dtype=dtype)
+        self.v_proj = Linear(self.d_model, self.head_dim * self.num_heads, device=device, dtype=dtype)
+        self.output_proj = Linear(self.head_dim * self.num_heads, self.d_model, device=device, dtype=dtype)
+
+        # RoPE operates on per head dimensions
+        self.rope = RoPE(theta=theta, d_k=self.head_dim, max_seq_len=max_seq_len, device=device, dtype=dtype)
+
+    def forward(
+        self,
+        x: Float[Tensor, "... seq_len d_model"],
+        token_positions: Int[Tensor, "... seq_len"] | None = None,
+    ) -> Float[Tensor, "... seq_len d_model"]:
+        """Apply causal multi-head self-attention.
+
+        Args:
+            x: Shape (..., seq_len, d_model). seq_len must be <= max_seq_len.
+            token_positions: Optional, Default: arange(seq_len).
+                Shape (..., seq_len), integer absolute positions for RoPE.
+
+        Returns:
+            Tensor of the same shape as x.
+        """
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # reshaping the QKV projections into (..., num_heads, seq_len, d_k) shape for independent RoPE and Attention
+        q = rearrange(q, "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
+        k = rearrange(k, "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
+        v = rearrange(v, "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim", num_heads=self.num_heads)
+
+        # slicing a causal mask for the appropriate seq len
+        seq_len = x.shape[-2]
+        causal_mask = self.causal_mask[:seq_len, :seq_len]
+
+        # synthesizing token positions if missing
+        if token_positions is None:
+            token_positions = torch.arange(seq_len, device=x.device).unsqueeze(-2)
+
+        q = self.rope(q, token_positions)
+        k = self.rope(k, token_positions)
+
+        out = scaled_dot_product_attention(q, k, v, mask=causal_mask)
+
+        # merging head back into (..., seq_len, d_model)
+        out = rearrange(out, "... num_heads seq_len head_dim -> ... seq_len (num_heads head_dim)")
+
+        return self.output_proj(out)
+
+class TransformerBlock(nn.Module):
+    """A pre-norm Transformer block.
+
+    Two sub-layers:
+
+        x = x + MultiHeadSelfAttention(RMSNorm(x))
+        x = x + SwiGLU(RMSNorm(x))
+
+    PRE-norm normalizes the sub-layer's INPUT and adds the result to the residual. 
+    The original post-norm form, RMSNorm(x + sublayer(x)), puts a normalization 
+    directly on the residual path, so a gradient travelling from the last layer 
+    to the first crosses num_layers norm Jacobians instead of num_layers clean 
+    additions.
+
+    Shape is preserved: (..., seq_len, d_model) in and out.
+
+    Args:
+        d_model (int): Residual stream width.
+        num_heads (int): Attention heads. d_model must be divisible by it.
+        d_ff (int): Inner width of the feed-forward network.
+        device (torch.device | None): Device to store the parameters on.
+        dtype (torch.dtype | None): Data type of the parameters.
+        eps (float): RMSNorm epsilon.
+        theta (float): RoPE base Theta.
+        max_seq_len (int): Longest sequence RoPE and the causal mask must support.
+
+    Attributes:
+        ln1, ln2 (RMSNorm): Norms for the attention and feed-forward sub-layers.
+        attn (CausalMaskedMultiHeadSelfAttentionWithRoPE): Multi Head Self Attention
+            block with causal mask over non attending tokens.
+        ffn (SwiGLU): Position-wise feed-forward network.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        *,
+        eps: float = 1e-5,
+        theta: float,
+        max_seq_len: int,
+    ):
+        super().__init__()
+
+        self.ln1 = RMSNorm(d_model, eps, device=device, dtype=dtype)
+        self.attn = CausalMaskedMultiHeadSelfAttentionWithRoPE(
+            d_model, num_heads, theta=theta, max_seq_len=max_seq_len, device=device, dtype=dtype
+        )
+
+        self.ln2 = RMSNorm(d_model, eps, device=device, dtype=dtype)
+        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+
+    def forward(
+        self,
+        x: Float[Tensor, "... seq_len d_model"],
+    ) -> Float[Tensor, "... seq_len d_model"]:
+        """Run both pre-norm sub-layers. Shape is preserved."""
+        # normalize -> transform -> ADD to the residual.
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ffn(self.ln2(x))
+
+        return x
+
+
+class TransformerLM(nn.Module):
+    """Decoder-only Transformer language model.
+
+        token_embeddings -> num_layers x TransformerBlock -> ln_final -> lm_head
+
+    Takes integer token IDs of shape (batch, seq_len) and returns next-token
+    LOGITS of shape (batch, seq_len, vocab_size).
+
+    Args:
+        d_model (int): Residual stream width.
+        num_heads (int): Attention heads per block.
+        d_ff (int): Inner width of each feed-forward network.
+        theta (float): RoPE base Theta.
+        vocab_size (int): Number of tokens; sizes both the embedding and the LM head.
+        context_length (int): Maximum sequence length. Sizes the RoPE tables and
+            causal masks inside every block.
+        num_layers (int): Number of Transformer blocks.
+        device (torch.device | None): Device to store the parameters on.
+        dtype (torch.dtype | None): Data type of the parameters.
+        eps (float): RMSNorm epsilon, shared by every norm in the model.
+
+    Attributes:
+        token_embeddings (Embedding): (vocab_size, d_model).
+        layers (nn.ModuleList): The Transformer blocks.
+        ln_final (RMSNorm): Final normalization before the LM head.
+        lm_head (Linear): (vocab_size, d_model). Same shape as token_embeddings.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        theta: float,
+        vocab_size: int,
+        context_length: int,
+        num_layers: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        *,
+        eps: float = 1e-5,
+    ):
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+
+        self.token_embeddings = Embedding(self.vocab_size, d_model, device=device, dtype=dtype)
+
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model, num_heads, d_ff, device=device, dtype=dtype,
+                    eps=eps, theta=theta, max_seq_len=self.context_length,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.ln_final = RMSNorm(d_model, eps, device=device, dtype=dtype)
+        self.lm_head = Linear(d_model, self.vocab_size, device=device, dtype=dtype)
+
+    def forward(
+            self,
+            in_indices: Int[Tensor, "batch_size sequence_length"]
+        ):
+        """Map token IDs to next-token logits.
+
+        Args:
+            in_indices: Integer token IDs, values in [0, vocab_size).
+                sequence_length must be <= context_length.
+
+        Returns:
+            Unnormalized logits of shape (batch, sequence_length, vocab_size).
+        """
+        x = self.token_embeddings(in_indices)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        # pre-norm blocks do not normalize their own output, so the accumulated
+        # residual stream needs one final normalization before the LM head
+        x = self.ln_final(x)
+
+        # logits
+        return self.lm_head(x)

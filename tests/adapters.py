@@ -10,7 +10,20 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.train_bpe import train_bpe
-from cs336_basics.modules import Linear, Embedding, RMSNorm, SwiGLU, silu, RoPE, softmax, scaled_dot_product_attention
+from cs336_basics.modules import (
+    Linear,
+    Embedding,
+    RMSNorm,
+    SwiGLU,
+    silu,
+    RoPE,
+    softmax,
+    scaled_dot_product_attention,
+    CausalMaskedMultiHeadSelfAttention,
+    CausalMaskedMultiHeadSelfAttentionWithRoPE,
+    TransformerBlock,
+    TransformerLM,
+)
 
 def run_linear(
     d_in: int,
@@ -116,7 +129,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    return scaled_dot_product_attention(Q, K, V, mask)
+    return scaled_dot_product_attention(Q, K, V, mask=mask)
 
 
 def run_multihead_self_attention(
@@ -150,7 +163,17 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    mha = CausalMaskedMultiHeadSelfAttention(
+            d_model, num_heads
+        )
+    mha.load_state_dict({
+        "q_proj.weight": q_proj_weight,
+        "k_proj.weight": k_proj_weight,
+        "v_proj.weight": v_proj_weight,
+        "output_proj.weight": o_proj_weight,
+    })
+    
+    return mha(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -190,7 +213,17 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    mha = CausalMaskedMultiHeadSelfAttentionWithRoPE(
+        d_model, num_heads, theta, max_seq_len
+    )
+    mha.load_state_dict({
+        "q_proj.weight": q_proj_weight,
+        "k_proj.weight": k_proj_weight,
+        "v_proj.weight": v_proj_weight,
+        "output_proj.weight": o_proj_weight,
+    })
+    
+    return mha(in_features, token_positions)
 
 
 def run_rope(
@@ -286,7 +319,13 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    block = TransformerBlock(
+        d_model, num_heads, d_ff, theta=theta, max_seq_len=max_seq_len
+    )
+    
+    block.load_state_dict(weights)
+    
+    return block(in_features)
 
 
 def run_transformer_lm(
@@ -368,7 +407,15 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    tranformer_lm = TransformerLM(
+        d_model=d_model, num_heads=num_heads, num_layers=num_layers,
+        d_ff=d_ff, theta=rope_theta, vocab_size=vocab_size,
+        context_length=context_length
+    )
+    
+    tranformer_lm.load_state_dict(weights)
+    
+    return tranformer_lm(in_indices)
 
 
 def run_rmsnorm(
