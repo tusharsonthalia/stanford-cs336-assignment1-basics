@@ -88,8 +88,7 @@ if __name__ == "__main__":
     VOCAB, CONTEXT = 50_257, 1_024
 
     # (num_layers, d_model, num_heads, d_ff)
-    # d_ff = 8/3 * d_model rounded to a multiple of 64, per handout section 3.4.2.
-    # The handout states 4288 for XL, which this reproduces:
+    # d_ff = 8/3 * d_model rounded to a multiple of 64.
     #    768 -> 2048    1024 -> 2752    1280 -> 3392    1600 -> 4288
     CONFIGS = {
         "GPT-2 small":  (12, 768, 12, 2048),

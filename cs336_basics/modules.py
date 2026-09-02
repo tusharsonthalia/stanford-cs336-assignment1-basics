@@ -662,7 +662,7 @@ class TransformerLM(nn.Module):
     def forward(
             self,
             in_indices: Int[Tensor, "batch_size sequence_length"]
-        ):
+        ) -> Float[Tensor, "batch_size sequence_length vocab_size"]:
         """Map token IDs to next-token logits.
 
         Args:
