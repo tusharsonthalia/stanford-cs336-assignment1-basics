@@ -1,12 +1,16 @@
-import torch
-from torch import Tensor
-from jaxtyping import Float, Int
-from typing import Iterable
 import math
+import os
+from collections.abc import Iterable
+from typing import IO, BinaryIO
+
+import torch
+from jaxtyping import Float, Int
+from torch import Tensor
+
 
 def cross_entropy(
     logits: Float[Tensor, "batch_size vocab_size"],
-    targets: Int[Tensor, "batch_size"]
+    targets: Int[Tensor, " batch_size"]
 ) -> Float[Tensor, ""]:
     """Average cross-entropy loss between logits and integer targets.
 
@@ -50,7 +54,7 @@ def cosine_learning_rate_schedule(
             p = (t - T_w) / (T_c - T_w)
             a_t = a_min + (1 + cos(pi * p)) / 2 * (a_max - a_min)
         t > T_c             (constant tail)
-            a_t = a_min                                
+            a_t = a_min
 
     Warmup exists because the moment estimates in Adam are not meaningful on
     the first few steps.
@@ -118,3 +122,49 @@ def gradient_clipping(
         grad.mul_(scale)
 
     return
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | BinaryIO | IO[bytes]
+):
+    """Serialize model weights, optimizer state, and iteration count to `out`.
+
+    Args:
+        model: Model whose state_dict to save.
+        optimizer: Optimizer whose state_dict to save.
+        iteration: Training step reached, so the LR schedule can resume in phase.
+        out: Destination path or writable binary file object.
+    """
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+
+    torch.save(checkpoint, out)
+
+def load_checkpoint(
+    src: str | os.PathLike | BinaryIO | IO[bytes],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer
+) -> int:
+    """Restore model and optimizer state from `src` in place.
+
+    Args:
+        src: Path or readable binary file object written by save_checkpoint.
+        model: Model to load weights into. Must match the saved architecture.
+        optimizer: Optimizer to load state into. Must be the same class, and its
+            param_groups must line up with the saved ones.
+
+    Returns:
+        The iteration count that was saved, for resuming the LR schedule.
+    """
+    checkpoint = torch.load(src, map_location="cpu")
+
+    iteration = checkpoint["iteration"]
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+
+    return iteration

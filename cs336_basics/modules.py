@@ -1,7 +1,8 @@
 import torch
-from torch import nn, Tensor
-from einops import einsum, reduce, rearrange
-from jaxtyping import Float, Int, Bool
+from einops import einsum, rearrange, reduce
+from jaxtyping import Bool, Float, Int
+from torch import Tensor, nn
+
 
 class Linear(nn.Module):
     """A bias-free linear transformation, y = x @ W.T.

@@ -1,5 +1,6 @@
-from contextlib import contextmanager
 import time
+from contextlib import contextmanager
+
 
 @contextmanager
 def timer(name: str, disable: bool = False):

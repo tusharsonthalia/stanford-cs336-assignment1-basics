@@ -1,4 +1,5 @@
-import re
+import regex as re
+
 
 class Tokenizer:
     def __init__(self, special_tokens):

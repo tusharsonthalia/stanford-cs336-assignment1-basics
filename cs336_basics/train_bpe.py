@@ -1,11 +1,12 @@
-from collections import Counter, defaultdict
-import regex as re
-import os
-from typing import BinaryIO
-import multiprocessing as mp
 import heapq
-from cs336_basics.helpers import timer
+import multiprocessing as mp
+import os
+from collections import Counter, defaultdict
+from typing import BinaryIO
 
+import regex as re
+
+from cs336_basics.helpers import timer
 
 # Global Flags
 GPT_2_REGEX = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -246,7 +247,7 @@ def train_bpe(
 
     with timer("Chunk Boundaries", TIMER_FLAG):
         # 1. Chunk the file for parallelly pre-tokenize
-        split_special_tokens = "|".join((re.escape(s) for s in sorted(special_tokens, key=len, reverse=True)))
+        split_special_tokens = "|".join(re.escape(s) for s in sorted(special_tokens, key=len, reverse=True))
         with open(input_path, "rb") as f:
             chunks = find_chunk_boundaries(f, split_special_tokens.encode('utf-8'), num_processes)
 

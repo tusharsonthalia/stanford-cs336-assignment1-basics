@@ -1,7 +1,9 @@
-import torch
-from torch import optim, Tensor
-from typing import Callable, Iterable
 import math
+from collections.abc import Callable, Iterable
+
+import torch
+from torch import Tensor, optim
+
 
 class SGD(optim.Optimizer):
     """Reference SGD with a decaying step size.
@@ -121,7 +123,7 @@ class AdamW(optim.Optimizer):
                 # EMAs updated in place -- mul_ then add_(alpha=)
                 first_moment.mul_(beta_1).add_(grad, alpha=(1 - beta_1))
                 # addcmul_ fuses g*g and the accumulate into one kernel
-                second_moment.mul_(beta_2).addcmul_(grad, grad, value=(1 - beta_2));
+                second_moment.mul_(beta_2).addcmul_(grad, grad, value=(1 - beta_2))
 
                 adjusted_lr = lr * math.sqrt(1 - math.pow(beta_2, t)) / (1 - math.pow(beta_1, t))
                 param.addcdiv_(first_moment, second_moment.sqrt().add_(eps), value=-adjusted_lr)

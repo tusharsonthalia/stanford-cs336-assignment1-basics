@@ -15,5 +15,5 @@ gunzip owt_valid.txt.gz
 cd ..
 
 # running the BPE tokenizer
-uv run scripts/train_bpe_tinystories.py 
-uv run scripts/train_bpe_owt.py 
+uv run scripts/tokenize_and_encode.py tinystories
+uv run scripts/tokenize_and_encode.py owt
