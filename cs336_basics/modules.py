@@ -249,17 +249,19 @@ class RoPE(nn.Module):
 
         # angles reach thousands of radians at long context, where a float32 ulp
         # is ~1e-4; compute in float64 and cast only the bounded sin/cos results
-        seq_positions = torch.arange(0, max_seq_len, device=device, dtype=torch.float64)
+        seq_positions = torch.arange(0, max_seq_len, dtype=torch.float64)
 
         # pair_idx = 0, 2, 4, ...
-        pair_idx = torch.arange(0, d_k, 2, device=device, dtype=torch.float64)
+        pair_idx = torch.arange(0, d_k, 2, dtype=torch.float64)
         inv_freq = theta ** (-pair_idx / d_k)
 
         # outer product -> (max_seq_len, d_k/2)
         angles = seq_positions.reshape(-1, 1) * inv_freq.reshape(1, -1)
+        sin_angles = torch.sin(angles).to(dtype=dtype, device=device)
+        cos_angles = torch.cos(angles).to(dtype=dtype, device=device)
 
-        self.register_buffer("sin_table", torch.sin(angles).to(dtype=dtype), persistent=False)
-        self.register_buffer("cos_table", torch.cos(angles).to(dtype=dtype), persistent=False)
+        self.register_buffer("sin_table", sin_angles, persistent=False)
+        self.register_buffer("cos_table", cos_angles, persistent=False)
 
     def forward(
         self,
