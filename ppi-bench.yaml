@@ -1,0 +1,136 @@
+# PPI baseline-benchmark GPU pod
+# -----------------------------------------------------------------------------
+# A single interactive GPU pod on the `inference` node pool that mounts the
+# shared JFS volume (so it sees both this repo and the model weights/eval data
+# already staged at /jfs/share/structure/project/PPI4Stru_1224).
+#
+# Launch:
+#   kubectl apply -f deployment/ppi-gpu-benchmark.pod.yaml
+#   kubectl get pod ppi-bench -n infra-dev -w          # wait for Running
+#   kubectl exec -it ppi-bench -n infra-dev -- bash    # get a shell
+#
+# Inside the pod, set up the benchmark env once (persists on /jfs across restarts):
+#   cd /jfs/tushar-sonthalia/vc-model-factory/models/protein_protein_interaction
+#   bash evaluation/setup_env.sh
+#   source /jfs/tushar-sonthalia/envs/ppi-bench/bin/activate
+#   cd evaluation && python bench.py --preflight-only
+# Then follow evaluation/README.md.
+# Tear down when done (GPUs are scarce — don't leave it idle):
+#   kubectl delete pod ppi-bench -n infra-dev
+#
+# Scheduling recipe mirrors the existing GPU workspaces (dikshant-workspace /
+# likhitvch2): role=vcharness-dev + nvidia.com/gpu tolerations, 1 GPU,
+# jfs-pvc-root mounted at /jfs.
+#
+# NOTE: tolerations/nodeSelector are immutable on a live Pod — to change them you
+# must `kubectl delete pod ppi-bench -n infra-dev` before re-applying.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ppi-bench
+  namespace: infra-dev
+  labels:
+    app: ppi-bench
+    owner: tushar
+  annotations:
+    # No service mesh needed for a benchmark pod — keeps it single-container and
+    # Ready immediately (workspaces run 2/2 with istio; we don't need that here).
+    sidecar.istio.io/inject: "false"
+spec:
+  restartPolicy: Never
+  serviceAccountName: default-editor
+  # Do NOT add a nodeSelector. Neither
+  # `cloud.google.com/gke-accelerator: nvidia-h100-80gb` (this cluster doesn't
+  # set that label) nor `cloud.google.com/gke-nodepool: vcharness-dev` works:
+  # pinning to a pool drops the inference-pool nodes out of the candidate set
+  # ("didn't match Pod's node affinity/selector") and the pod stays Pending.
+  # Tolerations alone are enough to reach an H100.
+  tolerations:
+    - key: role
+      operator: Equal
+      value: vcharness-dev
+      effect: NoSchedule
+    # inference nodes (dikshant-workspace / likhitvch GPU workspaces live
+    # here) carry a different taint value — tolerate both so the scheduler can
+    # use whichever pool has a free GPU.
+    - key: role
+      operator: Equal
+      value: vcharness-dev
+      effect: NoSchedule
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: ppi-bench
+      # Same runtime base the model is served on (deployment/docker/Dockerfile).
+      # fair-esm / peft / python-multipart are pip-installed at benchmark time
+      # (they live in the per-app runtime_env, not the base image).
+      image: rayproject/ray-llm:latest-py311-cu128
+      command: ["sleep", "infinity"]
+      env:
+        # The mirror of the deployment's gs://.../protein_protein_interaction/
+        # PPI4Stru. NOT /jfs/share/structure/project/PPI4Stru_1224 — that is the
+        # TRAINING tree: it has the dG head but no protein_map_*.csv, so
+        # manifest.validate_cell_line_csvs hard-fails the worker at boot and the
+        # screen endpoint never comes up.
+        - name: PPI_BASE_DIR
+          value: "/jfs/inference-engine/data/PPI4Stru"
+        - name: PPI_BATCH_SIZE
+          value: "64"
+        - name: PPI_USE_AMP
+          value: "0"            # baseline = no AMP; flip to "1" for the bf16 run
+        - name: HF_HOME
+          value: "/jfs/inference-engine/hf_cache"
+        - name: TORCH_HOME
+          value: "/jfs/tushar-sonthalia/envs/torch-cache"   # persist the ESM-2 hub download across pods
+        # --- uv -------------------------------------------------------------
+        # Set here, not in ~/.bashrc: container env reaches `kubectl exec` shells
+        # and survives the pod recreate that wipes $HOME (restartPolicy: Never).
+        #
+        # Code lives on /jfs so git tracks it; virtualenvs do NOT. Measured on
+        # this pod (torch 2.11 + cu130, 78 packages, ~4.8G):
+        #   cache+venv both on /jfs : 24m04s to build cold
+        #   venv on /jfs            : import torch 4.6s warm / ~91s cold,
+        #                             full project import 11-14s warm
+        #   venv on local disk      : import torch 1.5s, full import 2.8s
+        #   rebuild local venv from the warm /jfs cache: ~35s
+        # So the 4.9G of wheels persists here on /jfs, and each project's venv is
+        # rebuilt on local disk per pod by setup-uv.sh (in this repo), which
+        # points <repo>/.venv at /home/ray/venvs/<name> via a symlink.
+        - name: UV_CACHE_DIR
+          value: "/jfs/tushar-sonthalia/tushar/stanford-cs336-assignment1-basics/.uv-cache"
+        # NOTE: UV_PROJECT_ENVIRONMENT is deliberately NOT set. It takes
+        # precedence over each project's .venv symlink, so a single global value
+        # would silently force every /jfs project into one shared virtualenv.
+        #
+        # NOTE: the managed interpreter also stays on local disk on purpose. A
+        # venv's bin/python is a symlink into UV_PYTHON_INSTALL_DIR, so putting
+        # that on /jfs would drag the whole CPython stdlib through FUSE on every
+        # process start. It is only ~112M and uv re-fetches it during the sync.
+      # Keep requests small: the only node in the pool with a free GPU has very
+      # little CPU/memory headroom left, and an 8 CPU / 72Gi request is what
+      # kept this pod Pending ("Insufficient cpu" / "Insufficient memory" on the
+      # one node that did have a GPU). The benchmark is GPU-bound.
+      resources:
+        requests:
+          cpu: "8"
+          memory: 72Gi
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "8"
+          memory: 72Gi
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: jfs-pvc-root
+          mountPath: /jfs
+        - name: dshm
+          mountPath: /dev/shm
+  volumes:
+    - name: jfs-pvc-root
+      persistentVolumeClaim:
+        claimName: jfs-pvc-root
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
