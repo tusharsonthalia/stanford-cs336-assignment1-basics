@@ -32,6 +32,15 @@ def build_model(config: RunConfig) -> TransformerLM:
         eps=config.model.eps,
     )
 
+def build_optimizer(config: RunConfig, model: torch.nn.Module) -> AdamW:
+    return AdamW(
+        params=model.parameters(),
+        lr=config.optimizer.lr,
+        betas=config.optimizer.betas,
+        eps=config.optimizer.eps,
+        weight_decay=config.optimizer.weight_decay,
+    )
+
 
 def describe(config: RunConfig, train_tokens: int, validation_tokens: int) -> None:
     """Print what produced this log -- a sweep's numbers are useless without it."""
@@ -94,13 +103,7 @@ def train(config: RunConfig) -> list[dict]:
 
     train_data, validation_data = config.dataset.load()
     model = build_model(config)
-    optimizer = AdamW(
-        params=model.parameters(),
-        lr=config.optimizer.lr,
-        betas=config.optimizer.betas,
-        eps=config.optimizer.eps,
-        weight_decay=config.optimizer.weight_decay,
-    )
+    optimizer = build_optimizer(config)
     describe(config, train_data.size, validation_data.size)
 
     model.train()
