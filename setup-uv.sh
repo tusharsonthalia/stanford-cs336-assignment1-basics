@@ -122,6 +122,20 @@ uv() {
     command uv "$@"
 }
 
+# --- Nsight Systems ----------------------------------------------------------
+# The pod image ships cuda-nsight-compute but NOT nsight-systems, and we have no
+# root to apt-install it. It was extracted from the CUDA .deb with `dpkg-deb -x`
+# into ../tools/ on /jfs, so it survives a pod recreate like .uv-cache does.
+#
+# This must sit ABOVE the --env-only return: that is the path ~/.bashrc takes,
+# and it is the one that needs nsys on PATH.
+_UV_NSYS="$(dirname "$_UV_REPO")/tools/nsight-systems/opt/nvidia/nsight-systems/2026.3.2/target-linux-x64"
+case ":$PATH:" in
+    *":$_UV_NSYS:"*) ;;                                  # already there
+    *) [ -d "$_UV_NSYS" ] && export PATH="$_UV_NSYS:$PATH" ;;
+esac
+unset _UV_NSYS
+
 if [ "${1:-}" = "--env-only" ]; then
     unset _UV_SELF _UV_REPO _UV_VENV_ROOT
     return 0 2>/dev/null || exit 0
@@ -194,7 +208,14 @@ for _repo in "${_uv_projects[@]}"; do
     # VS Code interpreter picker work on THIS machine. It flips to whichever
     # machine last ran setup, and nothing above depends on it -- uv is always
     # given an explicit UV_PROJECT_ENVIRONMENT, so a dangling .venv is harmless.
-    ln -sfn "$_target" "$_repo/.venv" 2>/dev/null || true
+    # NOTE: this used to be `ln -sfn "$_target" "$_repo/.venv"`, which repointed
+    # <repo>/.venv at whichever machine ran setup last. That broke the VS Code
+    # Python extension on the *other* machine every single time, because Pylance
+    # discovers the interpreter via ${workspaceFolder}/.venv and silently falls
+    # back to a system Python when it dangles. .venv is now left alone: it is
+    # pinned to the notebook host (where the editor runs) and never rewritten.
+    # Nothing here depends on it -- uv is always handed an explicit
+    # UV_PROJECT_ENVIRONMENT (see gotcha 1 in the header).
 
     [ -z "${_UV_PRIMARY:-}" ] && _UV_PRIMARY="$_target"
     echo "setup-uv: syncing $_repo"
